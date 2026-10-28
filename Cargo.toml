@@ -1,0 +1,14 @@
+[package]
+name = "fmc"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.104"
+color-print = "0.3.7"
+derive_more = { version = "2.1.1", features = ["full"] }
+itertools = "0.15.0"
+nom = "8.0.0"
+nom-language = "0.1.0"
+rustc-hash = "2.1.3"
+rustyline = "19.0.0"
