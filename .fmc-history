@@ -58,3 +58,21 @@ a<x>.c
 [x 33]a.c
 [x]a.c
 [x 33]a.c
+a<x>.x
+[x]a.a<x>.x
+[x].a 
+[x]a.x 
+[x]a.<x>.x
+[x]a.<x>.'a
+[x]a.a<x>.'a
+[x]a.a<x>.'4
+[x]a.a<x>.'a
+[x]a.a<x>.a
+[x]a.a<x>.'a
+[b]a. [x]a.a<x>.'a
+[b]a. [x]a.a<x>.a
+[b]a. [x]a.a<x>.'a
+[b]a. [x]a.a<x>.'23
+[b]a. [x]a.a<x>.'a
+[b]a. [x]a.a<x>.['a]
+[b]a. [x]a.a<x>.['a].*

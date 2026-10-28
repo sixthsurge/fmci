@@ -1,5 +1,9 @@
+use std::fmt::{Debug, Display};
+use std::sync::Arc;
+
 use color_print::cprintln;
-use derive_more::Display;
+use derive_more::{Display, IsVariant};
+use itertools::Itertools;
 use nom::branch::alt;
 use nom::bytes::complete::tag;
 use nom::combinator::all_consuming;
@@ -14,11 +18,11 @@ use nom::{
     IResult,
 };
 use nom_language::error::convert_error;
-use rustc_hash::FxHashSet;
+use rustc_hash::{FxHashMap, FxHashSet};
 use rustyline::error::ReadlineError;
 use rustyline::DefaultEditor;
 
-#[derive(Clone, Debug, Display, PartialEq, Eq)]
+#[derive(Clone, Debug, Display, PartialEq, Eq, IsVariant)]
 enum Term {
     #[display("{_0}")]
     Variable(String),
@@ -114,6 +118,139 @@ impl Term {
             Self::Loop(m, _) => m.substitute(x, n),
             Self::Choice(_) => {}
         }
+    }
+}
+
+trait Stack: Debug + Display {
+    fn is_empty(&self) -> bool;
+    fn push(&mut self, t: Term);
+    fn pop(&mut self) -> Option<Term>;
+}
+
+/// Regular stack that just stores terms. (Not a 'magic' IO stack.)
+#[derive(Debug, Display, Default)]
+#[display("{}", DisplayVec(&_0))]
+struct VecStack(Vec<Term>);
+
+impl Stack for VecStack {
+    fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    fn push(&mut self, t: Term) {
+        self.0.push(t)
+    }
+
+    fn pop(&mut self) -> Option<Term> {
+        self.0.pop()
+    }
+}
+
+#[derive(Clone, Debug, Display, PartialEq, Eq)]
+#[display("{_0} -> {_1}")]
+struct Continuation(String, Term);
+
+#[derive(Debug)]
+struct State {
+    memory: FxHashMap<String, Box<dyn Stack>>,
+    term: Term,
+    continuation_stack: Vec<Continuation>,
+}
+
+impl State {
+    // "A _final_ state is of the form (S_A, i, epsilon)"
+    fn is_final(&self) -> bool {
+        self.term.is_choice() && self.continuation_stack.is_empty()
+    }
+
+    // "a _failure_ state is of the form (S_A, x, K) or (S_A, a<x>.M, K)"
+    fn is_failure(&self) -> bool {
+        match &self.term {
+            Term::Variable(_) => true,
+            Term::Abstraction(a, _, _) => self.memory.get(a).is_none_or(|s| s.is_empty()),
+            _ => false,
+        }
+    }
+
+    fn transition(mut self) -> Option<Self> {
+        self.term = match self.term {
+            Term::Application(a, n, m) => {
+                self.memory
+                    .entry(a)
+                    .or_insert(Box::new(VecStack::default()))
+                    .push(*n);
+                *m
+            }
+            Term::Abstraction(a, x, m) => {
+                let Some(stack) = self.memory.get_mut(&a) else {
+                    // Failure state.
+                    return None;
+                };
+                let Some(n) = stack.pop() else {
+                    // Failure state.
+                    return None;
+                };
+
+                let mut t = *m;
+                t.substitute(&x, &n);
+                t
+            }
+            Term::Choice(i) => {
+                let Some(Continuation(j, M)) = self.continuation_stack.pop() else {
+                    // Final state.
+                    return None;
+                };
+
+                if i == j {
+                    M
+                } else {
+                    Term::Choice(i)
+                }
+            }
+            Term::Case(n, i, m) => {
+                self.continuation_stack.push(Continuation(i, *m));
+                *n
+            }
+            Term::Loop(m, i) => {
+                let v = m.as_ref().clone();
+                self.continuation_stack
+                    .push(Continuation(i.clone(), Term::Loop(m, i)));
+                v
+            }
+            t => t,
+        };
+        Some(self)
+    }
+}
+
+impl Display for State {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Memory:")?;
+        for (name, value) in self
+            .memory
+            .iter()
+            .filter(|(_, stack)| !stack.is_empty())
+            .sorted_by(|(left_name, _), (right_name, _)| String::cmp(left_name, right_name))
+        {
+            write!(f, " {}({})", name, value)?;
+        }
+
+        write!(f, "\nTerm: {}\n", self.term)?;
+
+        write!(
+            f,
+            "Continuation Stack: {}\n",
+            DisplayVec(&self.continuation_stack)
+        )?;
+
+        if self.is_final() {
+            write!(f, "(FINAL)\n")?;
+        }
+        if self.is_failure() {
+            write!(f, "(FAILURE)\n")?;
+        }
+
+        Ok(())
     }
 }
 
@@ -236,9 +373,51 @@ fn main() -> anyhow::Result<()> {
             }
         };
         println!("{t}");
+
+        let mut state = State {
+            memory: FxHashMap::default(),
+            term: t,
+            continuation_stack: vec![],
+        };
+        println!("{state}");
+
+        loop {
+            if state.is_final() {
+                let Term::Choice(final_choice) = state.term else {
+                    panic!();
+                };
+                cprintln!("<green>success</>: terminated with choice <cyan>{final_choice}</>");
+                break;
+            }
+            if state.is_failure() {
+                cprintln!(
+                    "<yellow>failure</>: machine terminated with irreducible term <cyan>{}</>",
+                    state.term
+                );
+                break;
+            }
+            state = state.transition().expect("state should have a transition");
+            println!("{state}");
+        }
     }
 
     Ok(())
+}
+
+struct DisplayVec<'a, T>(&'a Vec<T>)
+where
+    T: Display;
+
+impl<'a, T> Display for DisplayVec<'a, T>
+where
+    T: Display,
+{
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        for (i, x) in self.0.iter().enumerate() {
+            write!(f, "{}{}", if i == 0 { "" } else { ", " }, x)?;
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
