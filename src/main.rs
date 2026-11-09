@@ -5,26 +5,70 @@ use color_print::cprintln;
 use derive_more::{Display, IsVariant};
 use dyn_clone::DynClone;
 use itertools::Itertools;
+use nom::Parser;
 use nom::branch::alt;
 use nom::bytes::complete::{is_not, tag, take_until};
-use nom::character::complete::{multispace1, one_of};
-use nom::combinator::{all_consuming, eof, not, opt, success, value, verify};
+use nom::character::complete::multispace1;
+use nom::combinator::{all_consuming, opt, success, value, verify};
 use nom::error::context;
 use nom::multi::many0;
-use nom::sequence::{pair, preceded, terminated};
-use nom::Parser;
+use nom::sequence::{preceded, terminated};
 use nom::{
-    character::complete::{alphanumeric1, char, multispace0},
-    combinator::map,
-    error::ParseError,
-    sequence::delimited,
     IResult,
+    character::complete::{alphanumeric1, char},
+    combinator::map,
+    sequence::delimited,
 };
 use nom_language::error::convert_error;
 use nom_language::precedence::left_assoc;
 use rustc_hash::{FxHashMap, FxHashSet};
-use rustyline::error::ReadlineError;
 use rustyline::DefaultEditor;
+use rustyline::error::ReadlineError;
+
+const DEFAULT_STACK_NAME: &'static str = "Lambda";
+
+#[derive(Clone, Debug, Display, PartialEq, Eq)]
+enum BaseType {
+    #[display("Unit")]
+    Unit,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+struct Type(FxHashMap<String, (Vec<BaseType>, Vec<BaseType>)>);
+
+impl Type {
+    fn get(desc: &[(&str, &[BaseType], &[BaseType])]) -> Self {
+        let mut ty = Self::default();
+        for (stack, pushed, popped) in desc.iter().copied() {
+            ty.0.insert(stack.to_owned(), (pushed.to_owned(), popped.to_owned()));
+        }
+        ty
+    }
+}
+
+impl Display for Type {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut right_names = vec![];
+        for (stack, (left, right)) in self
+            .0
+            .iter()
+            .sorted_by(|(left_name, _), (right_name, _)| String::cmp(left_name, right_name))
+        {
+            for popped in left.iter() {
+                write!(f, "{stack}({popped}) ")?;
+            }
+            for pushed in right.iter() {
+                right_names.push((stack, pushed));
+            }
+        }
+        write!(f, "=>")?;
+        for (stack, pushed) in right_names {
+            write!(f, " {stack}({pushed})")?;
+        }
+
+        Ok(())
+    }
+}
 
 #[derive(Clone, Debug, Display, PartialEq, Eq, IsVariant)]
 enum Term {
@@ -32,8 +76,8 @@ enum Term {
     Variable(String),
     #[display("([{_1}]{_0}. {_2})")]
     Application(String, Box<Term>, Box<Term>),
-    #[display("({_0}<{_1}>. {_2})")]
-    Abstraction(String, String, Box<Term>),
+    #[display("({}<{}{}>. {})", _0, _1, if let Some(ty) = _3 {format!(": {ty}")} else {String::new()}, _2)]
+    Abstraction(String, String, Box<Term>, Option<Type>),
     #[display("\'{_0}")]
     Choice(String),
     #[display("({_0}; {_1} -> {_2})")]
@@ -51,8 +95,16 @@ impl Term {
         Self::Application(stack.into(), Box::new(n), Box::new(m))
     }
 
-    fn abs(stack: impl Into<String>, x: impl Into<String>, m: Self) -> Self {
-        Self::Abstraction(stack.into(), x.into(), Box::new(m))
+    fn abs(stack: impl Into<String>, x: impl Into<String>, m: Self, ty: Option<Type>) -> Self {
+        Self::Abstraction(stack.into(), x.into(), Box::new(m), ty)
+    }
+
+    fn abs_untyped(stack: impl Into<String>, x: impl Into<String>, m: Self) -> Self {
+        Self::Abstraction(stack.into(), x.into(), Box::new(m), None)
+    }
+
+    fn abs_typed(stack: impl Into<String>, x: impl Into<String>, m: Self, ty: Type) -> Self {
+        Self::Abstraction(stack.into(), x.into(), Box::new(m), Some(ty))
     }
 
     fn choice(j: impl Into<String>) -> Self {
@@ -71,7 +123,7 @@ impl Term {
     fn free_variables(&self) -> FxHashSet<String> {
         match self {
             Self::Variable(name) => std::iter::once(name).cloned().collect(),
-            Self::Abstraction(_, name, body) => {
+            Self::Abstraction(_, name, body, _) => {
                 let mut s = body.free_variables();
                 s.remove(name);
                 s
@@ -94,7 +146,7 @@ impl Term {
                     *self = n.clone();
                 }
             }
-            Self::Abstraction(_, y, m) => {
+            Self::Abstraction(_, y, m, _) => {
                 if y == x {
                     *y = x.into();
                 } else {
@@ -251,7 +303,7 @@ impl State {
     fn is_failure(&self) -> bool {
         match &self.term {
             Term::Variable(_) => true,
-            Term::Abstraction(a, _, _) => self.memory.get(a).is_none_or(|s| s.is_empty()),
+            Term::Abstraction(a, _, _, _) => self.memory.get(a).is_none_or(|s| s.is_empty()),
             _ => false,
         }
     }
@@ -265,7 +317,7 @@ impl State {
                     .push(*n);
                 *m
             }
-            Term::Abstraction(a, x, m) => {
+            Term::Abstraction(a, x, m, _) => {
                 let Some(stack) = self.memory.get_mut(&a) else {
                     // Failure state.
                     return None;
@@ -285,11 +337,7 @@ impl State {
                     return None;
                 };
 
-                if i == j {
-                    m
-                } else {
-                    Term::Choice(i)
-                }
+                if i == j { m } else { Term::Choice(i) }
             }
             Term::Case(n, i, m) => {
                 self.continuation_stack.push(Continuation(i, *m));
@@ -361,6 +409,45 @@ fn parse_term<'a>(
         delimited(ignored(), inner, ignored())
     }
 
+    fn base_ty<'a>() -> impl Parser<&'a str, Output = BaseType, Error = E<'a>> {
+        context("base type", value(BaseType::Unit, sep(tag("Unit"))))
+    }
+    fn typevec_entry<'a>() -> impl Parser<&'a str, Output = (&'a str, BaseType), Error = E<'a>> {
+        context(
+            "type vec entry",
+            sep(alt((
+                map(base_ty(), |ty| (DEFAULT_STACK_NAME, ty)),
+                (alphanumeric1, delimited(char('('), base_ty(), char(')'))),
+            ))),
+        )
+    }
+    fn ty<'a>() -> impl Parser<&'a str, Output = Type, Error = E<'a>> {
+        context(
+            "type",
+            map(
+                (
+                    many0(sep(typevec_entry())),
+                    preceded(tag("=>"), many0(sep(typevec_entry()))),
+                ),
+                |(popped, pushed)| {
+                    let mut ty = Type::default();
+                    for (stack, base_ty) in popped {
+                        ty.0.entry(stack.into())
+                            .or_insert(Default::default())
+                            .0
+                            .push(base_ty);
+                    }
+                    for (stack, base_ty) in pushed {
+                        ty.0.entry(stack.into())
+                            .or_insert(Default::default())
+                            .1
+                            .push(base_ty);
+                    }
+                    ty
+                },
+            ),
+        )
+    }
     fn var<'a>() -> impl Parser<&'a str, Output = Term, Error = E<'a>> {
         context(
             "var",
@@ -382,7 +469,11 @@ fn parse_term<'a>(
                     preceded(char('.'), sep(parse_term)),
                 ),
                 |(n, stack, m)| {
-                    Term::Application(stack.unwrap_or("λ").into(), Box::new(n), Box::new(m))
+                    Term::Application(
+                        stack.unwrap_or(DEFAULT_STACK_NAME).into(),
+                        Box::new(n),
+                        Box::new(m),
+                    )
                 },
             ),
         )
@@ -393,10 +484,14 @@ fn parse_term<'a>(
             map(
                 (
                     opt(sep(alphanumeric1)),
-                    delimited(sep(char('<')), sep(alphanumeric1), sep(char('>'))),
+                    delimited(
+                        sep(char('<')),
+                        (sep(alphanumeric1), opt(preceded(char(':'), sep(ty())))),
+                        sep(char('>')),
+                    ),
                     preceded(sep(char('.')), sep(parse_term)),
                 ),
-                |(stack, x, m)| Term::Abstraction(stack.unwrap_or("λ").into(), x.into(), m.into()),
+                |(stack, (x, ty), m)| Term::abs(stack.unwrap_or(DEFAULT_STACK_NAME), x, m, ty),
             ),
         )
     }
@@ -425,7 +520,13 @@ fn parse_term<'a>(
                     preceded(sep(char('=')), parse_term),
                     preceded(sep(tag("in")), parse_term),
                 ),
-                |(x, n, m)| Term::app("λ", n, Term::abs("λ", x, m)),
+                |(x, n, m)| {
+                    Term::app(
+                        DEFAULT_STACK_NAME,
+                        n,
+                        Term::abs_untyped(DEFAULT_STACK_NAME, x, m),
+                    )
+                },
             ),
         )
     }
@@ -436,10 +537,12 @@ fn parse_term<'a>(
         )
     }
     fn jux<'a>() -> impl Parser<&'a str, Output = Term, Error = E<'a>> {
-        // m n as sugar for [n]λ.m
+        // m n as sugar for [n]Lambda.m
         context(
             "jux",
-            left_assoc(atom(), success(()), |m, _, n| Term::app("λ", n, m)),
+            left_assoc(atom(), success(()), |m, _, n| {
+                Term::app(DEFAULT_STACK_NAME, n, m)
+            }),
         )
     }
     fn case<'a>() -> impl Parser<&'a str, Output = Term, Error = E<'a>> {
@@ -578,7 +681,7 @@ mod tests {
     fn test_parse_term() {
         let var = Term::var;
         let app = Term::app;
-        let abs = Term::abs;
+        let abs = Term::abs_untyped;
         let choice = Term::choice;
         let case = Term::case;
         let loop_ = Term::loop_;
@@ -589,9 +692,9 @@ mod tests {
             ("[N]a.M", Some(app("a", var("N"), var("M")))),
             ("([N]a.M)", Some(app("a", var("N"), var("M")))),
             ("[ N ] a . M", Some(app("a", var("N"), var("M")))),
-            ("[N].M", Some(app("λ", var("N"), var("M")))),
+            ("[N].M", Some(app(DEFAULT_STACK_NAME, var("N"), var("M")))),
             ("a<x>.M", Some(abs("a", "x", var("M")))),
-            ("<x>.M", Some(abs("λ", "x", var("M")))),
+            ("<x>.M", Some(abs(DEFAULT_STACK_NAME, "x", var("M")))),
             ("a < x > . M", Some(abs("a", "x", var("M")))),
             ("'j", Some(choice("j"))),
             ("' j", None),
@@ -612,12 +715,20 @@ mod tests {
             ("in", None),
             (
                 "let x = y in z",
-                Some(app("λ", var("y"), abs("λ", "x", var("z")))),
+                Some(app(
+                    DEFAULT_STACK_NAME,
+                    var("y"),
+                    abs(DEFAULT_STACK_NAME, "x", var("z")),
+                )),
             ),
             // application by juxtaposition
             (
                 "a b c",
-                Some(app("λ", var("c"), app("λ", var("b"), var("a")))),
+                Some(app(
+                    DEFAULT_STACK_NAME,
+                    var("c"),
+                    app(DEFAULT_STACK_NAME, var("b"), var("a")),
+                )),
             ),
             // comments
             ("a // line comment", Some(var("a"))),
@@ -626,6 +737,32 @@ mod tests {
             ("// line comment\na", Some(var("a"))),
             ("//\na", Some(var("a"))),
             ("/* inline comment */ a", Some(var("a"))),
+            // types
+            (
+                "<x: a(Unit) => a(Unit) b(Unit)>.x",
+                Some(Term::abs_typed(
+                    DEFAULT_STACK_NAME,
+                    "x",
+                    var("x"),
+                    Type::get(&[
+                        ("a", &[BaseType::Unit], &[BaseType::Unit]),
+                        ("b", &[], &[BaseType::Unit]),
+                    ]),
+                )),
+            ),
+            (
+                "<x: Unit => a(Unit) b(Unit)>.x",
+                Some(Term::abs_typed(
+                    DEFAULT_STACK_NAME,
+                    "x",
+                    var("x"),
+                    Type::get(&[
+                        (DEFAULT_STACK_NAME, &[BaseType::Unit], &[]),
+                        ("a", &[], &[BaseType::Unit]),
+                        ("b", &[], &[BaseType::Unit]),
+                    ]),
+                )),
+            ),
         ];
 
         for (i, (input, expected)) in cases.into_iter().enumerate() {
