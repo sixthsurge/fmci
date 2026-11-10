@@ -1,18 +1,11 @@
 use std::cell::{Ref, RefCell};
-use std::fmt::{Debug, Display, Formatter};
+use std::fmt::{Display, Formatter};
 
 use auto_impl::auto_impl;
-use derive_more::{Display, From, Into, IsVariant};
-use dyn_clone::DynClone;
-use itertools::Itertools;
-use nom_language::error::convert_error;
-use rustc_hash::{FxBuildHasher, FxHashMap, FxHashSet, FxHasher};
-use rustyline::error::ReadlineError;
-use rustyline::DefaultEditor;
+use rustc_hash::FxBuildHasher;
 use string_interner::backend::BucketBackend;
 use string_interner::symbol::SymbolU32;
-use string_interner::{DefaultBackend, StringInterner};
-use thiserror::Error;
+use string_interner::StringInterner;
 
 use crate::{term::Term, types::Type};
 

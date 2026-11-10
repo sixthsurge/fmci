@@ -1,20 +1,8 @@
-use std::cell::{Ref, RefCell};
+use std::cell::Ref;
 use std::fmt::{Debug, Display, Formatter};
-use std::process::exit;
 
-use auto_impl::auto_impl;
-use color_print::cprintln;
-use derive_more::{Display, From, Into, IsVariant};
-use dyn_clone::DynClone;
-use itertools::Itertools;
-use nom_language::error::convert_error;
-use rustc_hash::{FxBuildHasher, FxHashMap, FxHashSet, FxHasher};
-use rustyline::error::ReadlineError;
-use rustyline::DefaultEditor;
-use string_interner::backend::BucketBackend;
-use string_interner::symbol::SymbolU32;
-use string_interner::{DefaultBackend, StringInterner};
-use thiserror::Error;
+use derive_more::{From, IsVariant};
+use rustc_hash::FxHashSet;
 
 use crate::storage::{DisplayWithStorage, InternedSymbol, Storage, WithStorage};
 use crate::types::Type;

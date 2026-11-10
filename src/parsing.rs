@@ -1,5 +1,3 @@
-use std::collections::HashMap;
-
 use itertools::Itertools;
 use nom::branch::alt;
 use nom::bytes::complete::{is_not, tag, take_until};
@@ -229,13 +227,6 @@ pub fn parse_term<'a>(
     storage: &Storage,
 ) -> IResult<&'a str, Term, nom_language::error::VerboseError<&'a str>> {
     all_consuming(|s| term(s, storage)).parse(s)
-}
-
-pub fn parse_type<'a>(
-    s: &'a str,
-    storage: &Storage,
-) -> IResult<&'a str, Type, nom_language::error::VerboseError<&'a str>> {
-    all_consuming(|s| ty(s, storage)).parse(s)
 }
 
 #[cfg(test)]

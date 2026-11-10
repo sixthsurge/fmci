@@ -4,28 +4,15 @@ mod storage;
 mod term;
 mod types;
 
-use std::cell::{Ref, RefCell};
-use std::fmt::{Debug, Display, Formatter};
-use std::process::exit;
 
-use auto_impl::auto_impl;
 use color_print::cprintln;
-use derive_more::{Display, From, Into, IsVariant};
-use dyn_clone::DynClone;
-use itertools::Itertools;
 use nom_language::error::convert_error;
-use rustc_hash::{FxBuildHasher, FxHashMap, FxHashSet, FxHasher};
 use rustyline::error::ReadlineError;
 use rustyline::DefaultEditor;
-use string_interner::backend::BucketBackend;
-use string_interner::symbol::SymbolU32;
-use string_interner::{DefaultBackend, StringInterner};
-use thiserror::Error;
 
 use crate::machine::{InputStack, OutputStack, State};
 use crate::parsing::parse_term;
-use crate::storage::{DisplayWithStorage, Storage, WithStorage};
-use crate::term::{Choice, StackIdentifier, Term, Variable};
+use crate::storage::{Storage, WithStorage};
 use crate::types::{typecheck, TypingContext};
 
 pub const DEFAULT_STACK_ID: &'static str = "Lambda";
