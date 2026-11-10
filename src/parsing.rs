@@ -19,8 +19,10 @@ use nom_language::precedence::left_assoc;
 use rustc_hash::FxHashMap;
 
 use crate::{
-    Choice, MemoryType, StackIdentifier, StackType, Storage, SumType, Term, Type, DEFAULT_STACK_ID,
-    EMPTY_STACK_SYMBOL, EMPTY_SUM_SYMBOL,
+    storage::Storage,
+    term::{StackIdentifier, Term},
+    types::{MemoryType, StackType, SumType, Type},
+    DEFAULT_STACK_ID, EMPTY_STACK_SYMBOL, EMPTY_SUM_SYMBOL,
 };
 
 /// Words that may not appear in identifiers.
