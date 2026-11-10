@@ -1,126 +1,170 @@
-use std::fmt::{Debug, Display};
+mod parsing;
+
+use std::cell::{Ref, RefCell};
+use std::fmt::{Debug, Display, Formatter};
 use std::process::exit;
 
+use auto_impl::auto_impl;
 use color_print::cprintln;
-use derive_more::{Display, IsVariant};
+use derive_more::{Display, From, Into, IsVariant};
 use dyn_clone::DynClone;
 use itertools::Itertools;
-use nom::Parser;
-use nom::branch::alt;
-use nom::bytes::complete::{is_not, tag, take_until};
-use nom::character::complete::multispace1;
-use nom::combinator::{all_consuming, opt, success, value, verify};
-use nom::error::context;
-use nom::multi::many0;
-use nom::sequence::{preceded, terminated};
-use nom::{
-    IResult,
-    character::complete::{alphanumeric1, char},
-    combinator::map,
-    sequence::delimited,
-};
 use nom_language::error::convert_error;
-use nom_language::precedence::left_assoc;
-use rustc_hash::{FxHashMap, FxHashSet};
-use rustyline::DefaultEditor;
+use rustc_hash::{FxBuildHasher, FxHashMap, FxHashSet, FxHasher};
 use rustyline::error::ReadlineError;
+use rustyline::DefaultEditor;
+use string_interner::backend::BucketBackend;
+use string_interner::symbol::SymbolU32;
+use string_interner::{DefaultBackend, StringInterner};
+use thiserror::Error;
 
-const DEFAULT_STACK_NAME: &'static str = "Lambda";
+use crate::parsing::parse_term;
 
-#[derive(Clone, Debug, Display, PartialEq, Eq)]
-enum BaseType {
-    #[display("Unit")]
-    Unit,
+pub const DEFAULT_STACK_ID: &'static str = "Lambda";
+pub const EMPTY_STACK_SYMBOL: &'static str = "Eps";
+pub const EMPTY_SUM_SYMBOL: &'static str = "0";
+
+pub type InternedSymbol = SymbolU32;
+pub type Interner = StringInterner<BucketBackend<InternedSymbol>, FxBuildHasher>;
+
+pub struct Storage {
+    strings: RefCell<Interner>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Default)]
-struct Type(FxHashMap<String, (Vec<BaseType>, Vec<BaseType>)>);
+impl Storage {
+    pub fn intern(&self, s: impl AsRef<str>) -> InternedSymbol {
+        self.strings.borrow_mut().get_or_intern(s)
+    }
 
-impl Type {
-    fn get(desc: &[(&str, &[BaseType], &[BaseType])]) -> Self {
-        let mut ty = Self::default();
-        for (stack, pushed, popped) in desc.iter().copied() {
-            ty.0.insert(stack.to_owned(), (pushed.to_owned(), popped.to_owned()));
-        }
-        ty
+    pub fn resolve<'s>(&'s self, s: InternedSymbol) -> Ref<'s, str> {
+        Ref::map(self.strings.borrow(), |strings| {
+            strings.resolve(s).expect("missing string for symbol")
+        })
+    }
+
+    pub fn var(&self, name: impl AsRef<str>) -> Term {
+        Term::Variable(self.intern(name).into())
+    }
+
+    pub fn app(&self, stack: impl AsRef<str>, n: Term, m: Term) -> Term {
+        Term::Application(self.intern(stack).into(), Box::new(n), Box::new(m))
+    }
+
+    pub fn abs(
+        &self,
+        stack: impl AsRef<str>,
+        x: impl AsRef<str>,
+        m: Term,
+        ty: Option<Type>,
+    ) -> Term {
+        Term::Abstraction(
+            self.intern(stack).into(),
+            self.intern(x).into(),
+            Box::new(m),
+            ty,
+        )
+    }
+
+    pub fn abs_untyped(&self, stack: impl AsRef<str>, x: impl AsRef<str>, m: Term) -> Term {
+        Term::Abstraction(
+            self.intern(stack).into(),
+            self.intern(x).into(),
+            Box::new(m),
+            None,
+        )
+    }
+
+    pub fn abs_typed(&self, stack: impl AsRef<str>, x: impl AsRef<str>, m: Term, ty: Type) -> Term {
+        Term::Abstraction(
+            self.intern(stack).into(),
+            self.intern(x).into(),
+            Box::new(m),
+            Some(ty),
+        )
+    }
+
+    pub fn choice(&self, j: impl AsRef<str>) -> Term {
+        Term::Choice(self.intern(j).into())
+    }
+
+    pub fn case(&self, m: Term, j: impl AsRef<str>, n: Term) -> Term {
+        Term::Case(Box::new(m), self.intern(j).into(), Box::new(n))
+    }
+
+    pub fn loop_(&self, m: Term, j: impl AsRef<str>) -> Term {
+        Term::Loop(Box::new(m), self.intern(j).into())
     }
 }
 
-impl Display for Type {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let mut right_names = vec![];
-        for (stack, (left, right)) in self
-            .0
-            .iter()
-            .sorted_by(|(left_name, _), (right_name, _)| String::cmp(left_name, right_name))
-        {
-            for popped in left.iter() {
-                write!(f, "{stack}({popped}) ")?;
-            }
-            for pushed in right.iter() {
-                right_names.push((stack, pushed));
-            }
+impl Default for Storage {
+    fn default() -> Self {
+        Self {
+            strings: RefCell::new(Interner::with_hasher(FxBuildHasher)),
         }
-        write!(f, "=>")?;
-        for (stack, pushed) in right_names {
-            write!(f, " {stack}({pushed})")?;
-        }
-
-        Ok(())
     }
 }
 
-#[derive(Clone, Debug, Display, PartialEq, Eq, IsVariant)]
-enum Term {
-    #[display("{_0}")]
-    Variable(String),
-    #[display("([{_1}]{_0}. {_2})")]
-    Application(String, Box<Term>, Box<Term>),
-    #[display("({}<{}{}>. {})", _0, _1, if let Some(ty) = _3 {format!(": {ty}")} else {String::new()}, _2)]
-    Abstraction(String, String, Box<Term>, Option<Type>),
-    #[display("\'{_0}")]
-    Choice(String),
-    #[display("({_0}; {_1} -> {_2})")]
-    Case(Box<Term>, String, Box<Term>),
-    #[display("{_0}^{_1}")]
-    Loop(Box<Term>, String),
+pub struct WithStorage<'a, T>(&'a T, &'a Storage);
+
+#[auto_impl(&, Box)]
+pub trait DisplayWithStorage {
+    fn fmt_with_storage(&self, f: &mut Formatter, storage: &Storage) -> std::fmt::Result;
+}
+
+impl<'a, T> Display for WithStorage<'a, T>
+where
+    T: DisplayWithStorage,
+{
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        let WithStorage(x, storage) = self;
+        x.fmt_with_storage(f, storage)
+    }
+}
+
+macro_rules! symbol_wrapper {
+    ($name: ident) => {
+        #[derive(Clone, Debug, PartialEq, Eq, Hash, From)]
+        pub struct $name(InternedSymbol);
+
+        impl $name {
+            fn from_str(s: impl AsRef<str>, int: &mut Interner) -> Self {
+                Self(int.get_or_intern(s))
+            }
+
+            fn as_str<'s>(&self, storage: &'s Storage) -> Ref<'s, str> {
+                storage.resolve(self.0)
+            }
+        }
+
+        impl DisplayWithStorage for $name {
+            fn fmt_with_storage(
+                &self,
+                f: &mut Formatter<'_>,
+                storage: &Storage,
+            ) -> std::fmt::Result {
+                write!(f, "{}", self.as_str(storage))
+            }
+        }
+    };
+}
+
+symbol_wrapper!(Variable);
+symbol_wrapper!(Choice);
+symbol_wrapper!(StackIdentifier);
+
+#[derive(Clone, Debug, PartialEq, Eq, IsVariant)]
+pub enum Term {
+    Variable(Variable),
+    Application(StackIdentifier, Box<Term>, Box<Term>),
+    Abstraction(StackIdentifier, Variable, Box<Term>, Option<Type>),
+    Choice(Choice),
+    Case(Box<Term>, Choice, Box<Term>),
+    Loop(Box<Term>, Choice),
 }
 
 impl Term {
-    fn var(name: impl Into<String>) -> Self {
-        Self::Variable(name.into())
-    }
-
-    fn app(stack: impl Into<String>, n: Self, m: Self) -> Self {
-        Self::Application(stack.into(), Box::new(n), Box::new(m))
-    }
-
-    fn abs(stack: impl Into<String>, x: impl Into<String>, m: Self, ty: Option<Type>) -> Self {
-        Self::Abstraction(stack.into(), x.into(), Box::new(m), ty)
-    }
-
-    fn abs_untyped(stack: impl Into<String>, x: impl Into<String>, m: Self) -> Self {
-        Self::Abstraction(stack.into(), x.into(), Box::new(m), None)
-    }
-
-    fn abs_typed(stack: impl Into<String>, x: impl Into<String>, m: Self, ty: Type) -> Self {
-        Self::Abstraction(stack.into(), x.into(), Box::new(m), Some(ty))
-    }
-
-    fn choice(j: impl Into<String>) -> Self {
-        Self::Choice(j.into())
-    }
-
-    fn case(m: Self, j: impl Into<String>, n: Self) -> Self {
-        Self::Case(Box::new(m), j.into(), Box::new(n))
-    }
-
-    fn loop_(m: Self, j: impl Into<String>) -> Self {
-        Self::Loop(Box::new(m), j.into())
-    }
-
-    /// Returns the set of variables that are named in `self` but not bound.
-    fn free_variables(&self) -> FxHashSet<String> {
+    /// Returns the set of variables that are named in `Self` but not bound.
+    pub fn free_variables(&self) -> FxHashSet<Variable> {
         match self {
             Self::Variable(name) => std::iter::once(name).cloned().collect(),
             Self::Abstraction(_, name, body, _) => {
@@ -139,7 +183,7 @@ impl Term {
     }
 
     /// Capture-avoiding substitution `self <- {n/x}self`
-    fn substitute(&mut self, x: &str, n: &Term) {
+    pub fn substitute(&mut self, storage: &Storage, x: &Variable, n: &Self) {
         match self {
             Self::Variable(y) => {
                 if y == x {
@@ -148,74 +192,324 @@ impl Term {
             }
             Self::Abstraction(_, y, m, _) => {
                 if y == x {
-                    *y = x.into();
+                    *y = x.clone();
                 } else {
                     let fv_n = n.free_variables();
                     if !fv_n.contains(y) {
-                        m.substitute(x, n);
+                        m.substitute(storage, x, n);
                     } else {
                         // Find fresh variable name.
                         let fv_m = m.free_variables();
+                        let y_name = y.as_str(storage).to_string();
                         let y_dash = (0..)
-                            .map(|i| format!("{}{}", y.as_str(), i))
+                            .map(|i| Variable(storage.intern(format!("{}{}", y_name, i))))
                             .find(|name| !fv_n.contains(name) && !fv_m.contains(name))
                             .unwrap();
 
-                        m.substitute(y, &Self::Variable(y_dash.clone()));
+                        m.substitute(storage, y, &Self::Variable(y_dash.clone()));
                         *y = y_dash;
-                        self.substitute(x, n);
+                        self.substitute(storage, x, n);
                     }
                 }
             }
             Self::Application(_, m1, m2) | Self::Case(m1, _, m2) => {
-                m1.substitute(x, n);
-                m2.substitute(x, n);
+                m1.substitute(storage, x, n);
+                m2.substitute(storage, x, n);
             }
-            Self::Loop(m, _) => m.substitute(x, n),
+            Self::Loop(m, _) => m.substitute(storage, x, n),
             Self::Choice(_) => {}
         }
     }
 }
 
-trait Stack: Debug + Display + DynClone {
+impl DisplayWithStorage for Term {
+    fn fmt_with_storage(&self, f: &mut Formatter, storage: &Storage) -> std::fmt::Result {
+        match self {
+            Self::Variable(x) => WithStorage(x, storage).fmt(f),
+            Self::Application(st, n, m) => write!(
+                f,
+                "[{}]{}. {}",
+                WithStorage(n, storage),
+                WithStorage(st, storage),
+                WithStorage(m, storage),
+            ),
+            Self::Abstraction(st, x, m, ty) => write!(
+                f,
+                "{}<{}{}>. {}",
+                WithStorage(st, storage),
+                WithStorage(x, storage),
+                if let Some(ty) = ty.as_ref() {
+                    format!(": {}", WithStorage(ty, storage))
+                } else {
+                    String::new()
+                },
+                WithStorage(m, storage),
+            ),
+            Self::Choice(i) => WithStorage(i, storage).fmt(f),
+            Self::Case(m, i, n) => write!(
+                f,
+                "{}; {} -> {}",
+                WithStorage(m, storage),
+                WithStorage(i, storage),
+                WithStorage(n, storage)
+            ),
+            Self::Loop(m, i) => {
+                write!(f, "{}^{}", WithStorage(m, storage), WithStorage(i, storage),)
+            }
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+pub struct StackType(Vec<Type>);
+
+impl StackType {
+    fn display(
+        &self,
+        f: &mut std::fmt::Formatter<'_>,
+        storage: &Storage,
+        reversed: bool,
+    ) -> std::fmt::Result {
+        let StackType(v) = self;
+        if v.is_empty() {
+            return f.write_str(EMPTY_STACK_SYMBOL);
+        }
+        if reversed {
+            for (i, ty) in v.iter().rev().enumerate() {
+                if i > 0 {
+                    write!(f, " ")?;
+                }
+                ty.fmt_with_storage(f, storage)?;
+            }
+        } else {
+            for (i, ty) in v.iter().enumerate() {
+                if i > 0 {
+                    write!(f, " ")?;
+                }
+                ty.fmt_with_storage(f, storage)?;
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+pub struct MemoryType(FxHashMap<StackIdentifier, StackType>);
+
+impl MemoryType {
+    fn singleton(stack: StackIdentifier, stack_type: StackType) -> Self {
+        let mut m = FxHashMap::default();
+        m.insert(stack, stack_type);
+        Self(m)
+    }
+
+    fn display(
+        &self,
+        f: &mut std::fmt::Formatter<'_>,
+        storage: &Storage,
+        reversed: bool,
+    ) -> std::fmt::Result {
+        let MemoryType(m) = self;
+        if m.is_empty() {
+            return f.write_str(EMPTY_STACK_SYMBOL);
+        }
+        for (i, (stack_id, stack_ty)) in m
+            .iter()
+            .sorted_by(|(left_name, _), (right_name, _)| {
+                str::cmp(
+                    storage.resolve(left_name.0).as_ref(),
+                    storage.resolve(right_name.0).as_ref(),
+                )
+            })
+            .enumerate()
+        {
+            if i > 0 {
+                write!(f, " ")?;
+            }
+            write!(f, "{}(", WithStorage(stack_id, storage))?;
+            stack_ty.display(f, storage, reversed)?;
+            write!(f, ")")?;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+pub struct SumType(FxHashMap<Choice, MemoryType>);
+
+impl SumType {
+    fn singleton(choice: Choice, mem_type: MemoryType) -> Self {
+        let mut m = FxHashMap::default();
+        m.insert(choice, mem_type);
+        Self(m)
+    }
+
+    fn plus(mut a: Self, b: Self) -> Self {
+        a.0.extend(b.0.into_iter());
+        a
+    }
+
+    fn display(
+        &self,
+        f: &mut std::fmt::Formatter<'_>,
+        storage: &Storage,
+        reversed: bool,
+    ) -> std::fmt::Result {
+        let SumType(s) = self;
+        if s.is_empty() {
+            return f.write_str(EMPTY_SUM_SYMBOL);
+        }
+        for (i, (choice, mem_ty)) in s
+            .iter()
+            .sorted_by(|(left_name, _), (right_name, _)| {
+                str::cmp(
+                    storage.resolve(left_name.0).as_ref(),
+                    storage.resolve(right_name.0).as_ref(),
+                )
+            })
+            .enumerate()
+        {
+            if i > 0 {
+                write!(f, " + ")?;
+            }
+            write!(f, "(")?;
+            mem_ty.display(f, storage, reversed)?;
+            write!(f, ")")?;
+            write!(f, ".{}", WithStorage(choice, storage))?;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+pub struct Type(MemoryType, SumType);
+
+impl DisplayWithStorage for Type {
+    fn fmt_with_storage(
+        &self,
+        f: &mut std::fmt::Formatter<'_>,
+        storage: &Storage,
+    ) -> std::fmt::Result {
+        let Type(input, output) = self;
+        input.display(f, storage, false)?;
+        f.write_str(" => ")?;
+        output.display(f, storage, true)?;
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct TypingContext(Vec<(Variable, Type)>);
+
+pub fn typecheck<'a>(
+    term: &'a Term,
+    context: &'a mut TypingContext,
+    storage: &Storage,
+) -> Result<Type, TypeError> {
+    match term {
+        Term::Variable(x) => context
+            .0
+            .iter()
+            .rev()
+            .find(|(id, _)| id == x)
+            .map(|(_, ty)| ty.clone())
+            .ok_or_else(|| TypeError::UnboundVariable(storage.resolve(x.0).to_owned())),
+        Term::Application(st, n, m) => {
+            let t_n = typecheck(n, context, storage)?;
+            let t_m = typecheck(m, context, storage)?;
+
+            let Type(MemoryType(mut m), _) = t_m.clone();
+            let popped = m.get_mut(st).and_then(|s| s.0.pop());
+            if popped.as_ref() == Some(&t_n) {
+                Ok(t_m)
+            } else {
+                Err(TypeError::BadApplication(
+                    WithStorage(&t_m, storage).to_string(),
+                    WithStorage(&t_n, storage).to_string(),
+                ))
+            }
+        }
+        Term::Abstraction(st, x, m, rho) => {
+            let rho = rho
+                .as_ref()
+                .ok_or_else(|| TypeError::BindingMissingType(storage.resolve(x.0).to_owned()))?
+                .clone();
+            context.0.push((x.clone(), rho.clone()));
+            let Type(mut sigma, tau) = typecheck(m, context, storage)?;
+            context.0.pop();
+            sigma.0.entry(st.clone()).or_default().0.push(rho);
+            Ok(Type(sigma, tau))
+        }
+        Term::Choice(i) => Ok(Type(
+            MemoryType::default(),
+            SumType::singleton(i.clone(), MemoryType::default()),
+        )),
+
+        _ => todo!(),
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Error)]
+pub enum TypeError {
+    #[error("Missing type in binding of '{_0}'.")]
+    BindingMissingType(String),
+    #[error("Variable '{_0}' appears unbound.")]
+    UnboundVariable(String),
+    #[error("Cannot apply {_0} to {_1}.")]
+    BadApplication(String, String),
+    #[error("{_0} is not a valid continuation after {_1}.")]
+    BadCase(String, String),
+}
+
+pub trait Stack: Debug + DisplayWithStorage + DynClone {
     fn is_empty(&self) -> bool;
-    fn push(&mut self, t: Term);
-    fn pop(&mut self) -> Option<Term>;
+    fn push(&mut self, t: Term, storage: &Storage);
+    fn pop(&mut self, storage: &Storage) -> Option<Term>;
 }
 
 dyn_clone::clone_trait_object!(Stack);
 
 /// Regular stack that just stores terms. (Not a 'magic' IO stack.)
-#[derive(Clone, Debug, Display, Default)]
-#[display("{}", DisplayVec(&_0))]
-struct VecStack(Vec<Term>);
+#[derive(Clone, Debug, Default)]
+pub struct VecStack(Vec<Term>);
 
 impl Stack for VecStack {
     fn is_empty(&self) -> bool {
         self.0.is_empty()
     }
 
-    fn push(&mut self, t: Term) {
+    fn push(&mut self, t: Term, _: &Storage) {
         self.0.push(t)
     }
 
-    fn pop(&mut self) -> Option<Term> {
+    fn pop(&mut self, _: &Storage) -> Option<Term> {
         self.0.pop()
     }
 }
 
+impl DisplayWithStorage for VecStack {
+    fn fmt_with_storage(&self, f: &mut Formatter, storage: &Storage) -> std::fmt::Result {
+        for (i, t) in self.0.iter().enumerate() {
+            if i != 0 {
+                f.write_str(" ")?;
+            }
+            WithStorage(t, storage).fmt(f)?;
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Debug, Display)]
-#[display("{{magic input stack}}")]
-struct InputStack;
+pub struct InputStack;
 
 impl Stack for InputStack {
     fn is_empty(&self) -> bool {
         false
     }
 
-    fn push(&mut self, _: Term) {}
+    fn push(&mut self, _: Term, _: &Storage) {}
 
-    fn pop(&mut self) -> Option<Term> {
+    fn pop(&mut self, storage: &Storage) -> Option<Term> {
         let mut rl = DefaultEditor::new().unwrap();
         rl.load_history(HISTORY_PATH).ok();
 
@@ -241,7 +535,7 @@ impl Stack for InputStack {
             };
             rl.save_history(HISTORY_PATH).unwrap();
 
-            return Some(match all_consuming(parse_term).parse(&line) {
+            return Some(match parse_term(&line, storage) {
                 Ok((_, t)) => t,
                 Err(nom::Err::Error(e)) | Err(nom::Err::Failure(e)) => {
                     cprintln!("<red>parse error</>: {}", convert_error(line.as_str(), e));
@@ -256,33 +550,70 @@ impl Stack for InputStack {
     }
 }
 
+impl DisplayWithStorage for InputStack {
+    fn fmt_with_storage(&self, f: &mut Formatter, storage: &Storage) -> std::fmt::Result {
+        f.write_str("{magic input stack}")
+    }
+}
+
 #[derive(Clone, Debug, Display)]
-#[display("{{magic output stack}}")]
-struct OutputStack;
+pub struct OutputStack;
 
 impl Stack for OutputStack {
     fn is_empty(&self) -> bool {
         true
     }
 
-    fn push(&mut self, t: Term) {
-        cprintln!("<cyan>Output</>: <yellow>{t}</>");
+    fn push(&mut self, t: Term, storage: &Storage) {
+        cprintln!("<cyan>Output</>: <yellow>{}</>", WithStorage(&t, storage));
     }
 
-    fn pop(&mut self) -> Option<Term> {
+    fn pop(&mut self, storage: &Storage) -> Option<Term> {
         None
     }
 }
 
-#[derive(Clone, Debug, Display, PartialEq, Eq)]
-#[display("{_0} -> {_1}")]
-struct Continuation(String, Term);
+impl DisplayWithStorage for OutputStack {
+    fn fmt_with_storage(&self, f: &mut Formatter, storage: &Storage) -> std::fmt::Result {
+        f.write_str("{magic output stack}")
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Continuation(Choice, Term);
+
+impl DisplayWithStorage for Continuation {
+    fn fmt_with_storage(&self, f: &mut Formatter, storage: &Storage) -> std::fmt::Result {
+        let Continuation(i, n) = self;
+        write!(
+            f,
+            "{} -> {}",
+            WithStorage(i, storage),
+            WithStorage(n, storage)
+        )
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct ContinuationStack(Vec<Continuation>);
+
+impl DisplayWithStorage for ContinuationStack {
+    fn fmt_with_storage(&self, f: &mut Formatter, storage: &Storage) -> std::fmt::Result {
+        for (i, t) in self.0.iter().enumerate() {
+            if i != 0 {
+                f.write_str(" ")?;
+            }
+            WithStorage(t, storage).fmt(f)?;
+        }
+        Ok(())
+    }
+}
 
 #[derive(Clone, Debug)]
 struct State {
-    memory: FxHashMap<String, Box<dyn Stack>>,
+    memory: FxHashMap<StackIdentifier, Box<dyn Stack>>,
     term: Term,
-    continuation_stack: Vec<Continuation>,
+    continuation_stack: ContinuationStack,
 }
 
 impl State {
@@ -290,13 +621,13 @@ impl State {
         Self {
             term,
             memory: FxHashMap::default(),
-            continuation_stack: Vec::default(),
+            continuation_stack: ContinuationStack::default(),
         }
     }
 
     // "A _final_ state is of the form (S_A, i, epsilon)"
     fn is_final(&self) -> bool {
-        self.term.is_choice() && self.continuation_stack.is_empty()
+        self.term.is_choice() && self.continuation_stack.0.is_empty()
     }
 
     // "a _failure_ state is of the form (S_A, x, K) or (S_A, a<x>.M, K)"
@@ -308,13 +639,13 @@ impl State {
         }
     }
 
-    fn transition(mut self) -> Option<Self> {
+    fn transition(mut self, storage: &Storage) -> Option<Self> {
         self.term = match self.term {
             Term::Application(a, n, m) => {
                 self.memory
                     .entry(a)
                     .or_insert(Box::new(VecStack::default()))
-                    .push(*n);
+                    .push(*n, storage);
                 *m
             }
             Term::Abstraction(a, x, m, _) => {
@@ -322,30 +653,35 @@ impl State {
                     // Failure state.
                     return None;
                 };
-                let Some(n) = stack.pop() else {
+                let Some(n) = stack.pop(storage) else {
                     // Failure state.
                     return None;
                 };
 
                 let mut t = *m;
-                t.substitute(&x, &n);
+                t.substitute(storage, &x, &n);
                 t
             }
             Term::Choice(i) => {
-                let Some(Continuation(j, m)) = self.continuation_stack.pop() else {
+                let Some(Continuation(j, m)) = self.continuation_stack.0.pop() else {
                     // Final state.
                     return None;
                 };
 
-                if i == j { m } else { Term::Choice(i) }
+                if i == j {
+                    m
+                } else {
+                    Term::Choice(i)
+                }
             }
             Term::Case(n, i, m) => {
-                self.continuation_stack.push(Continuation(i, *m));
+                self.continuation_stack.0.push(Continuation(i, *m));
                 *n
             }
             Term::Loop(m, i) => {
                 let v = m.as_ref().clone();
                 self.continuation_stack
+                    .0
                     .push(Continuation(i.clone(), Term::Loop(m, i)));
                 v
             }
@@ -355,24 +691,38 @@ impl State {
     }
 }
 
-impl Display for State {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl DisplayWithStorage for State {
+    fn fmt_with_storage(
+        &self,
+        f: &mut std::fmt::Formatter<'_>,
+        storage: &Storage,
+    ) -> std::fmt::Result {
         write!(f, "Memory:\n")?;
         for (name, value) in self
             .memory
             .iter()
             .filter(|(_, stack)| !stack.is_empty())
-            .sorted_by(|(left_name, _), (right_name, _)| String::cmp(left_name, right_name))
+            .sorted_by(|(left_name, _), (right_name, _)| {
+                str::cmp(
+                    storage.resolve(left_name.0).as_ref(),
+                    storage.resolve(right_name.0).as_ref(),
+                )
+            })
         {
-            write!(f, "- {} = {}\n", name, value)?;
+            write!(
+                f,
+                "- {} = {}\n",
+                WithStorage(name, storage),
+                WithStorage(value, storage)
+            )?;
         }
 
-        write!(f, "\nTerm: {}\n", self.term)?;
+        write!(f, "\nTerm: {}\n", WithStorage(&self.term, storage))?;
 
         write!(
             f,
             "Continuation Stack: {}\n",
-            DisplayVec(&self.continuation_stack)
+            WithStorage(&self.continuation_stack, storage)
         )?;
 
         if self.is_final() {
@@ -386,195 +736,6 @@ impl Display for State {
     }
 }
 
-fn parse_term<'a>(
-    s: &'a str,
-) -> IResult<&'a str, Term, nom_language::error::VerboseError<&'a str>> {
-    type E<'a> = nom_language::error::VerboseError<&'a str>;
-
-    const RESERVED_WORDS: &[&'static str] = &["let", "in"];
-
-    fn ignored<'a>() -> impl Parser<&'a str, Output = (), Error = E<'a>> {
-        let line_comment = value((), (tag("//"), many0(is_not("\n\r"))));
-        let inline_comment = value((), (tag("/*"), take_until("*/"), tag("*/")));
-        value(
-            (),
-            many0(alt((value((), multispace1), line_comment, inline_comment))),
-        )
-    }
-
-    fn sep<'a, F, O>(inner: F) -> impl Parser<&'a str, Output = O, Error = E<'a>>
-    where
-        F: Parser<&'a str, Output = O, Error = E<'a>>,
-    {
-        delimited(ignored(), inner, ignored())
-    }
-
-    fn base_ty<'a>() -> impl Parser<&'a str, Output = BaseType, Error = E<'a>> {
-        context("base type", value(BaseType::Unit, sep(tag("Unit"))))
-    }
-    fn typevec_entry<'a>() -> impl Parser<&'a str, Output = (&'a str, BaseType), Error = E<'a>> {
-        context(
-            "type vec entry",
-            sep(alt((
-                map(base_ty(), |ty| (DEFAULT_STACK_NAME, ty)),
-                (alphanumeric1, delimited(char('('), base_ty(), char(')'))),
-            ))),
-        )
-    }
-    fn ty<'a>() -> impl Parser<&'a str, Output = Type, Error = E<'a>> {
-        context(
-            "type",
-            map(
-                (
-                    many0(sep(typevec_entry())),
-                    preceded(tag("=>"), many0(sep(typevec_entry()))),
-                ),
-                |(popped, pushed)| {
-                    let mut ty = Type::default();
-                    for (stack, base_ty) in popped {
-                        ty.0.entry(stack.into())
-                            .or_insert(Default::default())
-                            .0
-                            .push(base_ty);
-                    }
-                    for (stack, base_ty) in pushed {
-                        ty.0.entry(stack.into())
-                            .or_insert(Default::default())
-                            .1
-                            .push(base_ty);
-                    }
-                    ty
-                },
-            ),
-        )
-    }
-    fn var<'a>() -> impl Parser<&'a str, Output = Term, Error = E<'a>> {
-        context(
-            "var",
-            map(
-                sep(verify(alphanumeric1, |w: &str| {
-                    !RESERVED_WORDS.iter().contains(&w)
-                })),
-                |s| Term::Variable(s.into()),
-            ),
-        )
-    }
-    fn app<'a>() -> impl Parser<&'a str, Output = Term, Error = E<'a>> {
-        context(
-            "app",
-            map(
-                (
-                    delimited(char('['), sep(parse_term), char(']')),
-                    opt(sep(alphanumeric1)),
-                    preceded(char('.'), sep(parse_term)),
-                ),
-                |(n, stack, m)| {
-                    Term::Application(
-                        stack.unwrap_or(DEFAULT_STACK_NAME).into(),
-                        Box::new(n),
-                        Box::new(m),
-                    )
-                },
-            ),
-        )
-    }
-    fn abs<'a>() -> impl Parser<&'a str, Output = Term, Error = E<'a>> {
-        context(
-            "abs",
-            map(
-                (
-                    opt(sep(alphanumeric1)),
-                    delimited(
-                        sep(char('<')),
-                        (sep(alphanumeric1), opt(preceded(char(':'), sep(ty())))),
-                        sep(char('>')),
-                    ),
-                    preceded(sep(char('.')), sep(parse_term)),
-                ),
-                |(stack, (x, ty), m)| Term::abs(stack.unwrap_or(DEFAULT_STACK_NAME), x, m, ty),
-            ),
-        )
-    }
-    fn paren<'a>() -> impl Parser<&'a str, Output = Term, Error = E<'a>> {
-        context(
-            "paren",
-            delimited(sep(char('(')), parse_term, sep(char(')'))),
-        )
-    }
-    fn choice<'a>() -> impl Parser<&'a str, Output = Term, Error = E<'a>> {
-        context(
-            "choice",
-            map(
-                sep(preceded(char('\''), alt((tag("*"), alphanumeric1)))),
-                |s| Term::Choice(s.into()),
-            ),
-        )
-    }
-    fn let_in<'a>() -> impl Parser<&'a str, Output = Term, Error = E<'a>> {
-        context(
-            "let-in",
-            map(
-                // let x = n in m
-                (
-                    preceded(sep(tag("let")), alphanumeric1),
-                    preceded(sep(char('=')), parse_term),
-                    preceded(sep(tag("in")), parse_term),
-                ),
-                |(x, n, m)| {
-                    Term::app(
-                        DEFAULT_STACK_NAME,
-                        n,
-                        Term::abs_untyped(DEFAULT_STACK_NAME, x, m),
-                    )
-                },
-            ),
-        )
-    }
-    fn atom<'a>() -> impl Parser<&'a str, Output = Term, Error = E<'a>> {
-        context(
-            "atom",
-            alt((app(), abs(), var(), choice(), paren(), let_in())),
-        )
-    }
-    fn jux<'a>() -> impl Parser<&'a str, Output = Term, Error = E<'a>> {
-        // m n as sugar for [n]Lambda.m
-        context(
-            "jux",
-            left_assoc(atom(), success(()), |m, _, n| {
-                Term::app(DEFAULT_STACK_NAME, n, m)
-            }),
-        )
-    }
-    fn case<'a>() -> impl Parser<&'a str, Output = Term, Error = E<'a>> {
-        context(
-            "case",
-            left_assoc(
-                sep(jux()),
-                preceded(
-                    char(';'),
-                    opt(terminated(sep(alphanumeric1), sep(tag("->")))),
-                ),
-                |m, j, n| Term::case(m, j.unwrap_or("*"), n),
-            ),
-        )
-    }
-    fn loop_<'a>() -> impl Parser<&'a str, Output = Term, Error = E<'a>> {
-        context(
-            "loop",
-            map(
-                (
-                    sep(jux()),
-                    sep(char('^')),
-                    sep(alt((alphanumeric1, tag("*")))),
-                ),
-                |(m, _, j)| Term::Loop(Box::new(m), j.into()),
-            ),
-        )
-    }
-
-    context("term", alt((loop_(), case(), jux(), atom()))).parse(s)
-}
-
 mod args {
     use clap::Parser;
 
@@ -586,23 +747,39 @@ mod args {
 }
 
 fn run_program(source: String) {
-    let t = match all_consuming(parse_term).parse(&source) {
+    let storage = Storage::default();
+
+    let t = match parse_term(&source, &storage) {
         Ok((_, t)) => t,
         Err(nom::Err::Error(e)) | Err(nom::Err::Failure(e)) => {
-            cprintln!("<red>parse error</>: {}", convert_error(source.as_str(), e));
+            cprintln!("<red>Parse error</>: {}", convert_error(source.as_str(), e));
             return;
         }
         Err(e) => {
-            cprintln!("<red>parse error</>: {}", e);
+            cprintln!("<red>Parse error</>: {e}");
             return;
         }
     };
-    cprintln!("<green>parsed</>: <yellow>{t}</>");
+    cprintln!("<green>Parsed</>: <yellow>{}</>", WithStorage(&t, &storage));
+
+    match typecheck(&t, &mut TypingContext::default(), &storage) {
+        Ok(ty) => {
+            cprintln!("<green>Type</>: <cyan>{}</>", WithStorage(&ty, &storage));
+        }
+        Err(e) => {
+            cprintln!("<red>Type error</>: {e}");
+            return;
+        }
+    }
 
     let mut state = State::new(t);
-    state.memory.insert("input".into(), Box::new(InputStack));
-    state.memory.insert("output".into(), Box::new(OutputStack));
-    println!("{state}");
+    state
+        .memory
+        .insert(storage.intern("input").into(), Box::new(InputStack));
+    state
+        .memory
+        .insert(storage.intern("output").into(), Box::new(OutputStack));
+    cprintln!("<dim>{}</>", WithStorage(&state, &storage));
 
     loop {
         if state.is_final() {
@@ -610,12 +787,14 @@ fn run_program(source: String) {
             break;
         }
         if state.is_failure() {
-            cprintln!("<yellow>Failure</>");
+            cprintln!("<red>Failure</>");
             break;
         }
-        state = state.transition().expect("state should have a transition");
+        state = state
+            .transition(&storage)
+            .expect("state should have a transition");
         println!("--------------------");
-        cprintln!("<dim>{state}</>");
+        cprintln!("<dim>{}</>", WithStorage(&state, &storage));
     }
 }
 
@@ -657,127 +836,22 @@ fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-struct DisplayVec<'a, T>(&'a Vec<T>)
-where
-    T: Display;
-
-impl<'a, T> Display for DisplayVec<'a, T>
-where
-    T: Display,
-{
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        for (i, x) in self.0.iter().enumerate() {
-            write!(f, "{}{}", if i == 0 { "" } else { ", " }, x)?;
-        }
-        Ok(())
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn test_parse_term() {
-        let var = Term::var;
-        let app = Term::app;
-        let abs = Term::abs_untyped;
-        let choice = Term::choice;
-        let case = Term::case;
-        let loop_ = Term::loop_;
-
-        let cases = [
-            ("x", Some(var("x"))),
-            (" x ", Some(var("x"))),
-            ("[N]a.M", Some(app("a", var("N"), var("M")))),
-            ("([N]a.M)", Some(app("a", var("N"), var("M")))),
-            ("[ N ] a . M", Some(app("a", var("N"), var("M")))),
-            ("[N].M", Some(app(DEFAULT_STACK_NAME, var("N"), var("M")))),
-            ("a<x>.M", Some(abs("a", "x", var("M")))),
-            ("<x>.M", Some(abs(DEFAULT_STACK_NAME, "x", var("M")))),
-            ("a < x > . M", Some(abs("a", "x", var("M")))),
-            ("'j", Some(choice("j"))),
-            ("' j", None),
-            ("M;j->N", Some(case(var("M"), "j", var("N")))),
-            // left-associativity of ;
-            (
-                "M;i->N;j->K",
-                Some(case(case(var("M"), "i", var("N")), "j", var("K"))),
-            ),
-            (
-                "M; i -> N; j -> K",
-                Some(case(case(var("M"), "i", var("N")), "j", var("K"))),
-            ),
-            ("M ; j -> N", Some(case(var("M"), "j", var("N")))),
-            ("M^j", Some(loop_(var("M"), "j"))),
-            ("M ^ j", Some(loop_(var("M"), "j"))),
-            ("let", None),
-            ("in", None),
-            (
-                "let x = y in z",
-                Some(app(
-                    DEFAULT_STACK_NAME,
-                    var("y"),
-                    abs(DEFAULT_STACK_NAME, "x", var("z")),
-                )),
-            ),
-            // application by juxtaposition
-            (
-                "a b c",
-                Some(app(
-                    DEFAULT_STACK_NAME,
-                    var("c"),
-                    app(DEFAULT_STACK_NAME, var("b"), var("a")),
-                )),
-            ),
-            // comments
-            ("a // line comment", Some(var("a"))),
-            ("a// line comment", Some(var("a"))),
-            ("a //", Some(var("a"))),
-            ("// line comment\na", Some(var("a"))),
-            ("//\na", Some(var("a"))),
-            ("/* inline comment */ a", Some(var("a"))),
-            // types
-            (
-                "<x: a(Unit) => a(Unit) b(Unit)>.x",
-                Some(Term::abs_typed(
-                    DEFAULT_STACK_NAME,
-                    "x",
-                    var("x"),
-                    Type::get(&[
-                        ("a", &[BaseType::Unit], &[BaseType::Unit]),
-                        ("b", &[], &[BaseType::Unit]),
-                    ]),
-                )),
-            ),
-            (
-                "<x: Unit => a(Unit) b(Unit)>.x",
-                Some(Term::abs_typed(
-                    DEFAULT_STACK_NAME,
-                    "x",
-                    var("x"),
-                    Type::get(&[
-                        (DEFAULT_STACK_NAME, &[BaseType::Unit], &[]),
-                        ("a", &[], &[BaseType::Unit]),
-                        ("b", &[], &[BaseType::Unit]),
-                    ]),
-                )),
-            ),
-        ];
-
-        for (i, (input, expected)) in cases.into_iter().enumerate() {
-            assert_eq!(parse_term(input).ok().map(|(_, t)| t), expected, "case {i}");
-        }
-    }
-
-    #[test]
     fn test_free_variables() {
         let cases = [("x", vec!["x"]), ("a<x>.x", vec![])];
+        let storage = Storage::default();
 
         for (input, expected) in cases {
             assert_eq!(
-                parse_term(input).unwrap().1.free_variables(),
-                expected.into_iter().map(str::to_string).collect()
+                parse_term(input, &storage).unwrap().1.free_variables(),
+                expected
+                    .into_iter()
+                    .map(|v| storage.intern(v).into())
+                    .collect()
             );
         }
     }
@@ -790,12 +864,14 @@ mod tests {
             ("a<x>.x", "x", "y", "a<x>.x"),
             ("a<x>.y", "y", "z", "a<x>.z"),
         ];
+        let storage = Storage::default();
 
         for (m, x, n, expected) in cases {
-            let mut t = parse_term(m).unwrap().1;
-            let n = parse_term(n).unwrap().1;
-            t.substitute(x, &n);
-            assert_eq!(t, parse_term(expected).unwrap().1);
+            let mut t = parse_term(m, &storage).unwrap().1;
+            let n = parse_term(n, &storage).unwrap().1;
+            let x: Variable = storage.intern(x).into();
+            t.substitute(&storage, &x, &n);
+            assert_eq!(t, parse_term(expected, &storage).unwrap().1);
         }
     }
 }
