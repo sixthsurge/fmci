@@ -4,7 +4,6 @@ mod storage;
 mod term;
 mod types;
 
-
 use color_print::cprintln;
 use nom_language::error::convert_error;
 use rustyline::error::ReadlineError;
@@ -18,13 +17,14 @@ use crate::types::{typecheck, TypingContext};
 pub const DEFAULT_STACK_ID: &'static str = "Lambda";
 pub const EMPTY_STACK_SYMBOL: &'static str = "Eps";
 pub const EMPTY_SUM_SYMBOL: &'static str = "0";
+pub const HISTORY_PATH: &'static str = ".fmc-history";
 
 use clap::Parser;
 
 #[derive(Parser)]
-pub struct Args {
+struct Args {
     #[arg(default_value_t = "".into())]
-    pub input: String,
+    input: String,
 }
 
 fn run_program(source: String) {
@@ -75,8 +75,6 @@ fn run_program(source: String) {
         cprintln!("<dim>{}</>", WithStorage(&state, &storage));
     }
 }
-
-const HISTORY_PATH: &'static str = ".fmc-history";
 
 fn main() -> anyhow::Result<()> {
     let args = Args::parse();

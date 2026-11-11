@@ -1,7 +1,7 @@
 use std::fmt::Debug;
 
 use itertools::Itertools;
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use thiserror::Error;
 
 use crate::storage::{DisplayWithStorage, Storage, WithStorage};
@@ -39,6 +39,18 @@ impl StackType {
         }
         Ok(())
     }
+
+    fn peek(&self) -> Option<&Type> {
+        if self.0.is_empty() {
+            None
+        } else {
+            Some(&self.0[self.0.len() - 1])
+        }
+    }
+
+    fn pop(&mut self) -> Option<Type> {
+        self.0.pop()
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Default)]
@@ -58,11 +70,12 @@ impl MemoryType {
         reversed: bool,
     ) -> std::fmt::Result {
         let MemoryType(m) = self;
-        if m.is_empty() {
+        if m.is_empty() || m.iter().all(|(_, v)| v.0.is_empty()) {
             return f.write_str(EMPTY_STACK_SYMBOL);
         }
         for (i, (stack_id, stack_ty)) in m
             .iter()
+            .filter(|(_, v)| !v.0.is_empty())
             .sorted_by(|(left_name, _), (right_name, _)| {
                 str::cmp(
                     storage.resolve(left_name.0).as_ref(),
@@ -162,18 +175,41 @@ pub fn typecheck<'a>(
             .find(|(id, _)| id == x)
             .map(|(_, ty)| ty.clone())
             .ok_or_else(|| TypeError::UnboundVariable(storage.resolve(x.0).to_owned())),
-        Term::Application(st, n, m) => {
-            let t_n = typecheck(n, context, storage)?;
-            let t_m = typecheck(m, context, storage)?;
+        Term::Application(a, n, m) => {
+            // I think there are two cases where [N]a. M pushing is ok where N: rho and M: sigma=>tau_I:
+            // 1 rho is at the top of sigma|a: then the type of application is the type of M with
+            //   rho popped off the a stack.
+            // 2 sigma|a is empty: then we can stack-expand with a(rho), taking us to case 1.
+            //   the type of the application will then be sigma => a(rho) tau
 
-            let Type(MemoryType(mut m), _) = t_m.clone();
-            let popped = m.get_mut(st).and_then(|s| s.0.pop());
-            if popped.as_ref() == Some(&t_n) {
-                Ok(t_m)
+            let pushed_type = typecheck(n, context, storage)?; // rho in the push rule.
+            let continuation_type = typecheck(m, context, storage)?; // a(rho) sigma => tau
+
+            let Type(MemoryType(input_memory), _) = &continuation_type;
+            let input_stack = input_memory.get(a);
+            if input_stack
+                .and_then(|stack_type| stack_type.peek())
+                .is_some_and(|arg_type| can_convert(&pushed_type, arg_type))
+            {
+                // Case 1.
+                let mut result = continuation_type;
+                result.0 .0.get_mut(a).expect("cannot be none").pop();
+                Ok(result)
+            } else if input_stack.is_none_or(|stack_type| stack_type.0.is_empty()) {
+                // Case 2.
+                let mut result = continuation_type;
+                for (_, MemoryType(output_memory)) in result.1 .0.iter_mut() {
+                    output_memory
+                        .entry(a.clone())
+                        .or_default()
+                        .0
+                        .insert(0, pushed_type.clone());
+                }
+                Ok(result)
             } else {
                 Err(TypeError::BadApplication(
-                    WithStorage(&t_m, storage).to_string(),
-                    WithStorage(&t_n, storage).to_string(),
+                    WithStorage(&continuation_type, storage).to_string(),
+                    WithStorage(&pushed_type, storage).to_string(),
                 ))
             }
         }
@@ -195,6 +231,70 @@ pub fn typecheck<'a>(
 
         _ => todo!(),
     }
+}
+
+// True if t1 can be converted to t2 using the expansion and inclusion rules:
+// Expansion is implemented by can_exp.
+// Inclusion is implemented by ensuring that t1's cases are a subset of t2's cases and,
+// for each choice that they have in common, conversion by expansion is possible.
+fn can_convert(t1: &Type, t2: &Type) -> bool {
+    for (choice, source_output) in &t1.1 .0 {
+        if t2
+            .1
+             .0
+            .get(choice)
+            .is_none_or(|dest_output| !can_expand((&t1.0, source_output), (&t2.0, dest_output)))
+        {
+            return false;
+        }
+    }
+    true
+}
+
+// True if t1 can be converted to t2 using the expansion rule:
+// t1 can be expanded to t2 if each stack's type vector in t2 ends
+// in the same stack's type vector in t1, and the remaining N elements
+// towards the start are the same as the first N elements in t1.
+fn can_expand(t1: (&MemoryType, &MemoryType), t2: (&MemoryType, &MemoryType)) -> bool {
+    let (t1_input, t1_output) = t1;
+    let (t2_input, t2_output) = t2;
+    for (stack_id, StackType(t2_output_typevec)) in &t2_output.0 {
+        // Get all type vectors as possibly empty slices.
+        let t2_output_typevec = t2_output_typevec.as_slice();
+
+        fn get_typevec<'a>(
+            stack_id: &StackIdentifier,
+            MemoryType(m): &'a MemoryType,
+        ) -> &'a [Type] {
+            m.get(&stack_id)
+                .map(|StackType(v)| v.as_slice())
+                .unwrap_or(&[])
+        }
+        let t1_output_typevec = get_typevec(stack_id, t1_output);
+        let t2_input_typevec = get_typevec(stack_id, t2_input);
+        let t1_input_typevec = get_typevec(stack_id, t1_input);
+
+        if t1_output_typevec.len() > t2_output_typevec.len()
+            || t1_input_typevec.len() > t2_input_typevec.len()
+            // Check that the start of t2's in/out vectors match up to where t1's in/out vectors begin.
+            || !t2_input_typevec[0..t2_input_typevec.len() - t1_input_typevec.len()]
+            .iter()
+            .eq(t2_output_typevec[0..t2_output_typevec.len() - t1_output_typevec.len()].iter())
+            // Check the end of t2's output typevec is equal to t1's output typevec.
+            || !t2_output_typevec
+            [t2_output_typevec.len() - t1_output_typevec.len() - 1..]
+            .iter()
+            .eq(t1_output_typevec.iter())
+            // Check the end of t2's input typevec is equal to t1's input typevec.
+            || !t2_input_typevec
+            [t2_input_typevec.len() - t1_input_typevec.len() - 1..]
+            .iter()
+            .eq(t1_input_typevec.iter())
+        {
+            return false;
+        }
+    }
+    true
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Error)]
