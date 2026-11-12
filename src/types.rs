@@ -1,7 +1,7 @@
 use std::fmt::Debug;
 
 use itertools::Itertools;
-use rustc_hash::{FxHashMap, FxHashSet};
+use rustc_hash::FxHashMap;
 use thiserror::Error;
 
 use crate::storage::{DisplayWithStorage, Storage, WithStorage};
@@ -51,6 +51,16 @@ impl StackType {
     fn pop(&mut self) -> Option<Type> {
         self.0.pop()
     }
+
+    fn can_convert(&self, other: &StackType) -> bool {
+        if self.0.len() != other.0.len() {
+            return false;
+        }
+        self.0
+            .iter()
+            .zip_eq(other.0.iter())
+            .all(|(a, b)| can_convert(a, b))
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Default)]
@@ -93,6 +103,19 @@ impl MemoryType {
         }
         Ok(())
     }
+
+    fn can_convert(&self, other: &MemoryType) -> bool {
+        for (st, stack_ty) in self.0.iter() {
+            if other
+                .0
+                .get(st)
+                .is_none_or(|other_mem_ty| !stack_ty.can_convert(&other_mem_ty))
+            {
+                return false;
+            }
+        }
+        true
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Default)]
@@ -103,6 +126,19 @@ impl SumType {
         let mut m = FxHashMap::default();
         m.insert(choice, mem_type);
         Self(m)
+    }
+
+    fn can_convert(&self, other: &SumType) -> bool {
+        for (i, mem_ty) in self.0.iter() {
+            if other
+                .0
+                .get(i)
+                .is_none_or(|other_mem_ty| !mem_ty.can_convert(&other_mem_ty))
+            {
+                return false;
+            }
+        }
+        true
     }
 
     pub fn plus(mut a: Self, b: Self) -> Self {
@@ -228,7 +264,48 @@ pub fn typecheck<'a>(
             MemoryType::default(),
             SumType::singleton(i.clone(), MemoryType::default()),
         )),
+        Term::Case(m, i, n) => {
+            // M needs to produce the input type of N on case i and the output type of N on any other case.
+            // If M has no output stack for case i that's fine as the situation can be solved by inc,
+            // but if it has a non-matching one then the type checking fails.
+            // The overall type of the case statement is the input of M going to the outputs of N
+            // summed with the outputs of M except its outputs on I.
 
+            let m_type = typecheck(m, context, storage)?;
+            let n_type = typecheck(n, context, storage)?;
+
+            let mut ok = true;
+
+            // M produces the input for N on case i.
+            ok &= m_type
+                .1
+                 .0
+                .get(i)
+                .is_none_or(|m_output_on_i| m_output_on_i.can_convert(&n_type.0));
+
+            // Except on case i, the outputs of M can be the output of N.
+            ok &= m_type.1 .0.iter().all(|(j, m_output_on_j)| {
+                n_type
+                    .1
+                     .0
+                    .get(j)
+                    .is_none_or(|n_output_on_j| m_output_on_j.can_convert(n_output_on_j))
+            });
+
+            if ok {
+                let mut result_type = m_type;
+                result_type.1 .0.remove(i);
+                result_type.1 = SumType::plus(result_type.1, n_type.1);
+
+                Ok(result_type)
+            } else {
+                Err(TypeError::BadCase(
+                    WithStorage(&m_type, storage).to_string(),
+                    WithStorage(i, storage).to_string(),
+                    WithStorage(&n_type, storage).to_string(),
+                ))
+            }
+        }
         _ => todo!(),
     }
 }
@@ -278,18 +355,19 @@ fn can_expand(t1: (&MemoryType, &MemoryType), t2: (&MemoryType, &MemoryType)) ->
             || t1_input_typevec.len() > t2_input_typevec.len()
             // Check that the start of t2's in/out vectors match up to where t1's in/out vectors begin.
             || !t2_input_typevec[0..t2_input_typevec.len() - t1_input_typevec.len()]
-            .iter()
-            .eq(t2_output_typevec[0..t2_output_typevec.len() - t1_output_typevec.len()].iter())
+                .iter()
+                .zip_eq(t2_output_typevec[0..t2_output_typevec.len() - t1_output_typevec.len()].iter())
+                .all(|(a, b)| can_convert(a, b))
             // Check the end of t2's output typevec is equal to t1's output typevec.
-            || !t2_output_typevec
-            [t2_output_typevec.len() - t1_output_typevec.len() - 1..]
-            .iter()
-            .eq(t1_output_typevec.iter())
+            || !t2_output_typevec[t2_output_typevec.len() - t1_output_typevec.len()..]
+                .iter()
+                .zip_eq(t1_output_typevec.iter())
+                .all(|(a, b)| can_convert(a, b))
             // Check the end of t2's input typevec is equal to t1's input typevec.
-            || !t2_input_typevec
-            [t2_input_typevec.len() - t1_input_typevec.len() - 1..]
-            .iter()
-            .eq(t1_input_typevec.iter())
+            || !t2_input_typevec[t2_input_typevec.len() - t1_input_typevec.len()..]
+                .iter()
+                .zip_eq(t1_input_typevec.iter())
+                .all(|(a, b)| can_convert(a, b))
         {
             return false;
         }
@@ -303,8 +381,8 @@ pub enum TypeError {
     BindingMissingType(String),
     #[error("Variable '{_0}' appears unbound.")]
     UnboundVariable(String),
-    #[error("Cannot apply {_0} to {_1}.")]
+    #[error("Cannot apply '{_0}' to '{_1}'.")]
     BadApplication(String, String),
-    #[error("{_0} is not a valid continuation after {_1}.")]
-    BadCase(String, String),
+    #[error("'{_2}' -> '{_1}' is not a valid continuation after '{_0}'.")]
+    BadCase(String, String, String),
 }

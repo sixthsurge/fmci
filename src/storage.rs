@@ -89,7 +89,9 @@ impl Default for Storage {
     }
 }
 
-pub struct WithStorage<'a, T>(pub &'a T, pub &'a Storage);
+pub struct WithStorage<'a, T>(pub &'a T, pub &'a Storage)
+where
+    T: ?Sized;
 
 #[auto_impl(&, Box)]
 pub trait DisplayWithStorage {
