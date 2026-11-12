@@ -306,12 +306,19 @@ pub fn typecheck<'a>(
                 ))
             }
         }
-        _ => todo!(),
+        Term::Loop(m, i) => {
+            // Type for a loop is the type of M with the output on i removed.
+            // If there was no output on i that's fine as the situation can be
+            // resolved by inclusion.
+            let mut result_type = typecheck(m, context, storage)?;
+            result_type.1 .0.remove(i);
+            Ok(result_type)
+        }
     }
 }
 
 // True if t1 can be converted to t2 using the expansion and inclusion rules:
-// Expansion is implemented by can_exp.
+// Expansion is implemented by can_expand.
 // Inclusion is implemented by ensuring that t1's cases are a subset of t2's cases and,
 // for each choice that they have in common, conversion by expansion is possible.
 fn can_convert(t1: &Type, t2: &Type) -> bool {
