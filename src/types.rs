@@ -59,7 +59,7 @@ impl StackType {
         self.0
             .iter()
             .zip_eq(other.0.iter())
-            .all(|(a, b)| can_convert(a, b))
+            .all(|(a, b)| a.can_convert(b))
     }
 }
 
@@ -181,6 +181,23 @@ impl SumType {
 #[derive(Clone, Debug, PartialEq, Eq, Default)]
 pub struct Type(pub MemoryType, pub SumType);
 
+impl Type {
+    /// True if t1 can be converted to t2 using the expansion and inclusion rules:
+    /// Expansion is implemented by can_expand.
+    /// Inclusion is implemented by ensuring that t1's cases are a subset of t2's cases and,
+    /// for each choice that they have in common, conversion by expansion is possible.
+    pub fn can_convert(&self, other: &Self) -> bool {
+        for (choice, source_output) in &self.1 .0 {
+            if other.1 .0.get(choice).is_none_or(|dest_output| {
+                !can_expand((&self.0, source_output), (&other.0, dest_output))
+            }) {
+                return false;
+            }
+        }
+        true
+    }
+}
+
 impl DisplayWithStorage for Type {
     fn fmt_with_storage(
         &self,
@@ -225,7 +242,7 @@ pub fn typecheck<'a>(
             let input_stack = input_memory.get(a);
             if input_stack
                 .and_then(|stack_type| stack_type.peek())
-                .is_some_and(|arg_type| can_convert(&pushed_type, arg_type))
+                .is_some_and(|arg_type| pushed_type.can_convert(arg_type))
             {
                 // Case 1.
                 let mut result = continuation_type;
@@ -317,24 +334,6 @@ pub fn typecheck<'a>(
     }
 }
 
-// True if t1 can be converted to t2 using the expansion and inclusion rules:
-// Expansion is implemented by can_expand.
-// Inclusion is implemented by ensuring that t1's cases are a subset of t2's cases and,
-// for each choice that they have in common, conversion by expansion is possible.
-fn can_convert(t1: &Type, t2: &Type) -> bool {
-    for (choice, source_output) in &t1.1 .0 {
-        if t2
-            .1
-             .0
-            .get(choice)
-            .is_none_or(|dest_output| !can_expand((&t1.0, source_output), (&t2.0, dest_output)))
-        {
-            return false;
-        }
-    }
-    true
-}
-
 // True if t1 can be converted to t2 using the expansion rule:
 // t1 can be expanded to t2 if each stack's type vector in t2 ends
 // in the same stack's type vector in t1, and the remaining N elements
@@ -364,17 +363,17 @@ fn can_expand(t1: (&MemoryType, &MemoryType), t2: (&MemoryType, &MemoryType)) ->
             || !t2_input_typevec[0..t2_input_typevec.len() - t1_input_typevec.len()]
                 .iter()
                 .zip_eq(t2_output_typevec[0..t2_output_typevec.len() - t1_output_typevec.len()].iter())
-                .all(|(a, b)| can_convert(a, b))
+                .all(|(a, b)| a.can_convert(b))
             // Check the end of t2's output typevec is equal to t1's output typevec.
             || !t2_output_typevec[t2_output_typevec.len() - t1_output_typevec.len()..]
                 .iter()
                 .zip_eq(t1_output_typevec.iter())
-                .all(|(a, b)| can_convert(a, b))
+                .all(|(a, b)| a.can_convert(b))
             // Check the end of t2's input typevec is equal to t1's input typevec.
             || !t2_input_typevec[t2_input_typevec.len() - t1_input_typevec.len()..]
                 .iter()
                 .zip_eq(t1_input_typevec.iter())
-                .all(|(a, b)| can_convert(a, b))
+                .all(|(a, b)| a.can_convert(b))
         {
             return false;
         }

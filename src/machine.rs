@@ -13,6 +13,7 @@ use rustyline::DefaultEditor;
 use crate::parsing::parse_term;
 use crate::storage::{DisplayWithStorage, Storage, WithStorage};
 use crate::term::{Choice, StackIdentifier, Term};
+use crate::types::{typecheck, Type, TypingContext};
 use crate::HISTORY_PATH;
 
 #[derive(Clone, Debug)]
@@ -64,12 +65,12 @@ impl State {
                     .push(*n, storage);
                 *m
             }
-            Term::Abstraction(a, x, m, _) => {
+            Term::Abstraction(a, x, m, ty) => {
                 let Some(stack) = self.memory.get_mut(&a) else {
                     // Failure state.
                     return None;
                 };
-                let Some(n) = stack.pop(storage) else {
+                let Some(n) = stack.pop(storage, ty.as_ref()) else {
                     // Failure state.
                     return None;
                 };
@@ -185,7 +186,7 @@ impl DisplayWithStorage for ContinuationStack {
 pub trait Stack: Debug + DisplayWithStorage + DynClone {
     fn is_empty(&self) -> bool;
     fn push(&mut self, t: Term, storage: &Storage);
-    fn pop(&mut self, storage: &Storage) -> Option<Term>;
+    fn pop(&mut self, storage: &Storage, expected_type: Option<&Type>) -> Option<Term>;
 }
 
 dyn_clone::clone_trait_object!(Stack);
@@ -203,7 +204,7 @@ impl Stack for VecStack {
         self.0.push(t)
     }
 
-    fn pop(&mut self, _: &Storage) -> Option<Term> {
+    fn pop(&mut self, _: &Storage, _: Option<&Type>) -> Option<Term> {
         self.0.pop()
     }
 }
@@ -230,12 +231,19 @@ impl Stack for InputStack {
 
     fn push(&mut self, _: Term, _: &Storage) {}
 
-    fn pop(&mut self, storage: &Storage) -> Option<Term> {
+    fn pop(&mut self, storage: &Storage, expected_ty: Option<&Type>) -> Option<Term> {
         let mut rl = DefaultEditor::new().unwrap();
         rl.load_history(HISTORY_PATH).ok();
 
         loop {
-            cprintln!("<cyan>Input</>: Enter a term");
+            if let Some(expected_type) = expected_ty {
+                cprintln!(
+                    "<cyan>Input</>: Enter a term of type <cyan>{}</>",
+                    WithStorage(expected_type, storage)
+                );
+            } else {
+                cprintln!("<cyan>Input</>: Enter a term");
+            }
             let line = match rl.readline("> ") {
                 Ok(line) => {
                     rl.add_history_entry(line.as_str()).unwrap();
@@ -257,7 +265,24 @@ impl Stack for InputStack {
             rl.save_history(HISTORY_PATH).unwrap();
 
             return Some(match parse_term(&line, storage) {
-                Ok((_, t)) => t,
+                Ok((_, term)) => {
+                    let ty = match typecheck(&term, &mut TypingContext::default(), &storage) {
+                        Ok(ty) => ty,
+                        Err(e) => {
+                            cprintln!("<red>Type error</>: {e}");
+                            continue;
+                        }
+                    };
+                    if let Some(expected_ty) = expected_ty && !ty.can_convert(expected_ty) {
+                        cprintln!(
+                            "<red>Type error</>: Can't convert {} to {}.",
+                            WithStorage(&ty, storage),
+                            WithStorage(expected_ty, storage)
+                        );
+                        continue;
+                    }
+                    term
+                }
                 Err(nom::Err::Error(e)) | Err(nom::Err::Failure(e)) => {
                     cprintln!("<red>parse error</>: {}", convert_error(line.as_str(), e));
                     continue;
@@ -289,7 +314,7 @@ impl Stack for OutputStack {
         cprintln!("<cyan>Output</>: <yellow>{}</>", WithStorage(&t, storage));
     }
 
-    fn pop(&mut self, _storage: &Storage) -> Option<Term> {
+    fn pop(&mut self, _: &Storage, _: Option<&Type>) -> Option<Term> {
         None
     }
 }
