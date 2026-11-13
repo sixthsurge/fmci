@@ -77,6 +77,8 @@ fn run_program(source: String) {
 }
 
 fn main() -> anyhow::Result<()> {
+    env_logger::init();
+
     let args = Args::parse();
 
     let mut rl = DefaultEditor::new()?;

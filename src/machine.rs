@@ -235,14 +235,17 @@ impl Stack for InputStack {
         let mut rl = DefaultEditor::new().unwrap();
         rl.load_history(HISTORY_PATH).ok();
 
-        loop {
+        for i in 0.. {
+            if i > 0 {
+                cprintln!("(retry)");
+            }
             if let Some(expected_type) = expected_ty {
                 cprintln!(
-                    "<cyan>Input</>: Enter a term of type <cyan>{}</>",
+                    "<blue>Input</>: Enter a term of type <cyan>{}</>",
                     WithStorage(expected_type, storage)
                 );
             } else {
-                cprintln!("<cyan>Input</>: Enter a term");
+                cprintln!("<blue>Input</>: Enter a term");
             }
             let line = match rl.readline("> ") {
                 Ok(line) => {
@@ -293,6 +296,7 @@ impl Stack for InputStack {
                 }
             });
         }
+        unreachable!("previous loop never breaks")
     }
 }
 
@@ -311,7 +315,7 @@ impl Stack for OutputStack {
     }
 
     fn push(&mut self, t: Term, storage: &Storage) {
-        cprintln!("<cyan>Output</>: <yellow>{}</>", WithStorage(&t, storage));
+        cprintln!("<blue>Output</>: <yellow>{}</>", WithStorage(&t, storage));
     }
 
     fn pop(&mut self, _: &Storage, _: Option<&Type>) -> Option<Term> {

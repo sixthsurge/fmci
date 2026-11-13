@@ -1,16 +1,31 @@
 // this program:
-// - inputs a term (this is expected to be a jump or the machine will fail)
-// - if it is '0 then outputs 3 and loops to the start
-// - if it is '1 then outputs 4 and loops to the start
-// - otherwise the jump will destroy everything on the continuation stack so the program terminates
+// - inputs a bool term (T or F)
+// - if it is T then outputs Hello
+// - if it is F then outputs Goodbye
 
-let print = <x>. [x]output. '* in
-
-let select = <a>. <b>. 
-    input<x>. 
-        x; 
-        0->([a]. '*); 
-        1->([b]. '*)
+let print:
+    Lambda(Eps => Eps.Hello + Eps.Goodbye) 
+    => 
+    output(Eps => Eps.Hello + Eps.Goodbye).*
+=
+    <x: Eps => Eps.Hello + Eps.Goodbye>. 
+        [x]output. *
 in
 
-((select (print 3) (print 4)); <x>. x; '*)^*
+let select:
+    Lambda(Eps => output(Eps => Eps.Hello + Eps.Goodbye).*) 
+    Lambda(Eps => output(Eps => Eps.Hello + Eps.Goodbye).*) 
+    input(Eps => Eps.T + Eps.F)
+    => 
+    Lambda(Eps => output(Eps => Eps.Hello + Eps.Goodbye).*).*
+= 
+    <a: Eps => output(Eps => Eps.Hello + Eps.Goodbye).*>. 
+    <b: Eps => output(Eps => Eps.Hello + Eps.Goodbye).*>. 
+        input<x: Eps => Eps.T + Eps.F>. x; 
+        T->([a]. *); 
+        F->([b]. *)
+in
+
+select (print Hello) (print Goodbye); 
+<x: Eps => output(Eps => Eps.Hello + Eps.Goodbye).*>. x;
+*

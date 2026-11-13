@@ -2,7 +2,8 @@ use std::cell::{Ref, RefCell};
 use std::fmt::{Display, Formatter};
 
 use auto_impl::auto_impl;
-use rustc_hash::FxBuildHasher;
+use nom_locate::LocatedSpan;
+use rustc_hash::{FxBuildHasher, FxHashMap};
 use string_interner::backend::BucketBackend;
 use string_interner::symbol::SymbolU32;
 use string_interner::StringInterner;
@@ -12,18 +13,34 @@ use crate::{term::Term, types::Type};
 pub type InternedSymbol = SymbolU32;
 pub type Interner = StringInterner<BucketBackend<InternedSymbol>, FxBuildHasher>;
 
+pub type Span<'a> = LocatedSpan<&'a str>;
+
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+pub struct TermId(usize);
+
+struct SourceRegion {}
+
+struct StorageInternal {
+    strings: Interner,
+    region_map: FxHashMap<TermId, SourceRegion>,
+}
+
 pub struct Storage {
-    strings: RefCell<Interner>,
+    // antipattern, yes
+    internal: RefCell<StorageInternal>,
 }
 
 impl Storage {
     pub fn intern(&self, s: impl AsRef<str>) -> InternedSymbol {
-        self.strings.borrow_mut().get_or_intern(s)
+        self.internal.borrow_mut().strings.get_or_intern(s)
     }
 
     pub fn resolve<'s>(&'s self, s: InternedSymbol) -> Ref<'s, str> {
-        Ref::map(self.strings.borrow(), |strings| {
-            strings.resolve(s).expect("missing string for symbol")
+        Ref::map(self.internal.borrow(), |internal| {
+            internal
+                .strings
+                .resolve(s)
+                .expect("missing string for symbol")
         })
     }
 
@@ -84,7 +101,10 @@ impl Storage {
 impl Default for Storage {
     fn default() -> Self {
         Self {
-            strings: RefCell::new(Interner::with_hasher(FxBuildHasher)),
+            internal: RefCell::new(StorageInternal {
+                strings: Interner::with_hasher(FxBuildHasher),
+                region_map: FxHashMap::default(),
+            }),
         }
     }
 }
