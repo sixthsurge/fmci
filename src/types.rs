@@ -369,12 +369,7 @@ pub fn typecheck<'a>(
 
             // Try again with N stack-expanded by M's output on i.
             if let Some(m_output_on_i) = m_type.1 .0.get(i) {
-                println!(
-                    "stack expanding with {}",
-                    WithStorage(&m_output_on_i, storage)
-                );
                 n_type.stack_expand(m_output_on_i);
-                println!("N type is now: {}", WithStorage(&n_type, storage));
                 if let Some(ty) = try_types(i, &m_type, &n_type) {
                     return Ok(ty);
                 }
